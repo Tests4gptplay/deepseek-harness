@@ -115,7 +115,7 @@ jobs:
                 try { Os.link(stage.getPath(), linked.getPath()); }
                 catch (ErrnoException e) { linkErrno = e.errno; }
                 result.put("hardLinkErrno", linkErrno);
-                if (linkErrno == 0) Os.unlink(linked.getPath());
+                if (linkErrno == 0 && !linked.delete()) throw new IOException("cannot remove hardlink probe");
                 Os.rename(stage.getPath(), target.getPath());
                 Os.chmod(target.getPath(), 0400);
                 java.io.FileDescriptor directory = Os.open(getFilesDir().getPath(), OsConstants.O_RDONLY, 0);
