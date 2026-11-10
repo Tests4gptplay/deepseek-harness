@@ -17,7 +17,6 @@ jobs:
       - uses: pnpm/action-setup@v4
         with:
           version: '11.28.5'
-          package_json_file: ''
       - name: Verify pnpm fallback without native binaries
         shell: bash
         run: |
@@ -62,6 +61,11 @@ jobs:
   android-filesystem:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
       - name: Enable KVM
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
