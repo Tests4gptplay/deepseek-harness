@@ -1,0 +1,57 @@
+name: Android attachment regression
+on:
+  push:
+    branches: [fix/android-termux-attachments-20261110]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: pnpm/action-setup@v4
+      - name: Install locked workspace dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Verify the same assertions fail on the original source
+        shell: bash
+        run: |
+          set -euo pipefail
+          path=packages/attachment/attachment-local/src/store.ts
+          cp "$path" "$RUNNER_TEMP/store-candidate.ts"
+          trap 'cp "$RUNNER_TEMP/store-candidate.ts" "$path"' EXIT
+          git show fcc0ad462172522aaf5c93a7b2e01f6b9f0b0159:"$path" > "$path"
+          set +e
+          pnpm exec vitest run packages/attachment/attachment-local/tests/store-android.spec.ts --reporter=json --outputFile="$RUNNER_TEMP/android-before.json"
+          result=$?
+          set -e
+          test "$result" -ne 0
+          python3 - <<'PY'
+          import json, os
+          p = os.path.join(os.environ['RUNNER_TEMP'], 'android-before.json')
+          data = json.load(open(p))
+          failures = [t['fullName'] for f in data['testResults'] for t in f['assertionResults'] if t['status'] == 'failed']
+          assert any('accepts a traverse-only home ancestor' in t for t in failures), failures
+          assert any('publishes and deduplicates when hard links fail' in t for t in failures), failures
+          print('ORIGINAL_SOURCE_REPRODUCED', len(failures), 'failing regression assertions')
+          PY
+      - name: Run attachment-local regression suite on candidate
+        run: pnpm exec vitest run packages/attachment/attachment-local/tests --reporter=verbose
+      - name: Typecheck and compile attachment-local dependency graph
+        run: pnpm exec tsc -b packages/attachment/attachment-local/tsconfig.json
+      - name: Check source diff
+        run: |
+          git diff --exit-code
+          git diff fcc0ad462172522aaf5c93a7b2e01f6b9f0b0159 --check
+          echo "VERIFIED_COMMIT=$GITHUB_SHA"
+          sha256sum packages/attachment/attachment-local/src/store.ts
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: android-attachment-before-report
+          path: ${{ runner.temp }}/android-before.json
+          if-no-files-found: ignore
