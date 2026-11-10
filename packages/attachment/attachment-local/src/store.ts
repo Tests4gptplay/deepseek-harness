@@ -2,7 +2,7 @@
 
 import { createHash, randomUUID } from 'node:crypto'
 import { constants, createReadStream } from 'node:fs'
-import { chmod, link, mkdir, open, readFile, unlink } from 'node:fs/promises'
+import { chmod, link, mkdir, open, readFile, rename, unlink } from 'node:fs/promises'
 import { dirname, join, parse, resolve } from 'node:path'
 import {
   AttachmentError,
@@ -127,13 +127,20 @@ export async function prepareImageFile(
  * Make a directory's entries durable (fsync on a read-only directory handle).
  * A synced file alone does not survive a crash when its directory entry never
  * reached storage, so the publication directory is synced before a durable
- * reference is reported.
+ * reference is reported. Only home ancestors may be traverse-only OS directories.
  */
-async function syncDirectory(path: string): Promise<void> {
+async function syncDirectory(path: string, allowUnreadableAncestor = false): Promise<void> {
   /* v8 ignore next -- Windows cannot open directory handles; NTFS metadata journaling owns entry durability there. */
   if (process.platform === 'win32') return
   /* v8 ignore start -- Windows cannot exercise directory fsync; POSIX behavior tests enforce this peer. */
-  const handle = await open(path, constants.O_RDONLY)
+  let handle
+  try {
+    handle = await open(path, constants.O_RDONLY)
+  } catch (error) {
+    if (allowUnreadableAncestor && error instanceof Error && 'code' in error
+      && (error.code === 'EACCES' || error.code === 'EPERM')) return
+    throw error
+  }
   try {
     await handle.sync()
   } finally {
@@ -152,8 +159,9 @@ async function syncDirectory(path: string): Promise<void> {
  * entry is harmless; skipping an unsynced one is not.
  * @param path - absolute directory to create.
  * @param boundary - absolute ancestor the caller vouches is already durable.
+ * @param allowUnreadableAncestors - permit traverse-only OS ancestors above DSH_HOME.
  */
-async function ensureDurableDirectory(path: string, boundary: string): Promise<void> {
+async function ensureDurableDirectory(path: string, boundary: string, allowUnreadableAncestors = false): Promise<void> {
   const target = resolve(path)
   const stop = resolve(boundary)
   await mkdir(target, { recursive: true, mode: 0o700 })
@@ -161,7 +169,7 @@ async function ensureDurableDirectory(path: string, boundary: string): Promise<v
   let level = target
   while (level !== stop) {
     const parent = dirname(level)
-    await syncDirectory(parent)
+    await syncDirectory(parent, allowUnreadableAncestors)
     /* v8 ignore next -- filesystem-root guard: callers pass a boundary that is an ancestor of path, so the walk reaches it first. */
     if (parent === level) return
     level = parent
@@ -169,14 +177,14 @@ async function ensureDurableDirectory(path: string, boundary: string): Promise<v
 }
 
 /**
- * Establish this process's proof that one DSH_HOME entry and every ancestor
- * below the filesystem root are durable. Mere existence is insufficient: a
- * concurrent process may have created the directory but not synced its parent.
+ * Sync one DSH_HOME entry and its readable ancestors once per process.
+ * Android owns traverse-only ancestors such as /data/data; the app can create
+ * neither those entries nor a directory handle for syncing them.
  */
 async function ensureDurableHome(path: string): Promise<string> {
   const home = resolve(path)
   if (!durableHomes.has(home)) {
-    await ensureDurableDirectory(home, parse(home).root)
+    await ensureDurableDirectory(home, parse(home).root, true)
     durableHomes.add(home)
   }
   return home
@@ -203,9 +211,9 @@ export async function commitPreparedImageFile(
 
 /**
  * Publish one immutable content-addressed object below a versioned attachment
- * root: staged write, fsync, hard-link into place, digest-verified EEXIST
- * deduplication, read-only mode, and durable directory entries from the
- * target's parent up to (excluding) `root`.
+ * root: staged write, fsync, atomic publication, digest-verified deduplication,
+ * read-only mode, and durable directory entries from the target's parent up to
+ * (excluding) `root`.
  * @param root - absolute `DSH_HOME/attachments/v1` root.
  * @param target - absolute final object path below `root`.
  * @param data - exact object bytes whose digest is `sha256`.
@@ -263,7 +271,7 @@ export async function publishImmutableObjectStream(
 }
 
 /**
- * Publish another durable hard-link name for an existing immutable object.
+ * Publish another durable name for an existing immutable object.
  * @param root - absolute versioned attachment root.
  * @param source - existing content-addressed object below `root`.
  * @param target - new alias below `root`.
@@ -282,7 +290,15 @@ export async function publishImmutableAlias(
     try {
       await link(source, target)
     } catch (error) {
-      /* v8 ignore next -- Private same-filesystem directories make EEXIST the only recoverable link race. */
+      if (hardLinksUnavailable(error)) {
+        await publishImmutableObjectStream(root, createReadStream(source), (actual) => {
+          if (actual !== sha256) {
+            throw new AttachmentError('Stored attachment failed integrity verification.', 'ATTACHMENT_CORRUPT')
+          }
+          return target
+        })
+        return
+      }
       if (!(error instanceof Error && 'code' in error && error.code === 'EEXIST')) throw error
       if (await digestFile(target) !== sha256) {
         throw new AttachmentError('Stored attachment failed integrity verification.', 'ATTACHMENT_CORRUPT')
@@ -312,9 +328,7 @@ async function stageImmutableObject(
   signal?: AbortSignal,
 ): Promise<StagedImmutableObject> {
   const staging = join(root, 'tmp')
-  // Establish DSH_HOME itself against the filesystem root once per process.
-  // Every process performs that proof independently, so observing a directory
-  // another process created can never be mistaken for durable publication.
+  // Sync each process's home boundary before publishing beneath it.
   const boundary = await ensureDurableHome(dirname(dirname(resolve(root))))
   await ensureDurableDirectory(staging, boundary)
   const temporary = join(staging, randomUUID())
@@ -347,6 +361,26 @@ async function stageImmutableObject(
   }
 }
 
+function hardLinksUnavailable(error: unknown): boolean {
+  return error instanceof Error && 'code' in error
+    && (error.code === 'EPERM' || error.code === 'EACCES'
+      || error.code === 'ENOTSUP' || error.code === 'EOPNOTSUPP')
+}
+
+async function publishStagedByRename(staged: StagedImmutableObject, target: string): Promise<void> {
+  try {
+    if (await digestFile(target) !== staged.sha256) {
+      throw new AttachmentError('Stored attachment failed integrity verification.', 'ATTACHMENT_CORRUPT')
+    }
+    return
+  } catch (error) {
+    if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error
+  }
+  // The staged file is already synced and closed. Same-filesystem rename never
+  // exposes partial bytes; concurrent valid writers publish the same digest.
+  await rename(staged.path, target)
+}
+
 async function publishStagedObject(
   root: string,
   target: string,
@@ -358,15 +392,18 @@ async function publishStagedObject(
     try {
       await link(staged.path, target)
     } catch (error) {
-      /* v8 ignore next -- Private same-filesystem directories make EEXIST the only recoverable link race. */
-      if (!(error instanceof Error && 'code' in error && error.code === 'EEXIST')) throw error
-      if (await digestFile(target) !== staged.sha256) {
-        throw new AttachmentError('Stored attachment failed integrity verification.', 'ATTACHMENT_CORRUPT')
+      if (hardLinksUnavailable(error)) {
+        await publishStagedByRename(staged, target)
+      } else {
+        if (!(error instanceof Error && 'code' in error && error.code === 'EEXIST')) throw error
+        if (await digestFile(target) !== staged.sha256) {
+          throw new AttachmentError('Stored attachment failed integrity verification.', 'ATTACHMENT_CORRUPT')
+        }
       }
     }
-    // Windows shares the read-only attribute across hard links and refuses to
-    // unlink either name once it is set, so discard the staging name first.
-    await unlink(staged.path)
+    // Discard a linked staging name before Windows read-only mode; rename has
+    // already consumed its staging name.
+    await removeTemporary(staged.path)
     // The target remains the sole link for a new object; this also restores
     // read-only mode when the deduplication path observes an existing object.
     await chmod(target, 0o400)
@@ -395,7 +432,7 @@ async function digestFile(path: string): Promise<string> {
 
 async function removeTemporary(path: string): Promise<void> {
   await unlink(path).catch(
-    /* v8 ignore next -- Cleanup can observe a staging name already removed after successful linking. */
+    /* v8 ignore next -- Cleanup can observe a staging name already removed after successful linking or renaming. */
     (cleanupError: unknown) => {
       /* v8 ignore next -- Any cleanup failure except an absent staging name must remain visible. */
       if (!(cleanupError instanceof Error && 'code' in cleanupError && cleanupError.code === 'ENOENT')) throw cleanupError
@@ -407,8 +444,8 @@ async function removeTemporary(path: string): Promise<void> {
  * Decode and normalize one image once, then publish the prepared object.
  * @param root - absolute `DSH_HOME/attachments/v1` root.
  * @param input - submitted encoded bytes and declared media type.
- * @param limits - resolved source admission policy.
- * @param policy - resolved normalization policy.
+ * @param limits - source admission policy.
+ * @param policy - independent normalization policy.
  * @returns durable content-addressed normalized image reference.
  */
 export async function saveImageFile(
