@@ -11,6 +11,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      - name: Fetch original comparison commit
+        run: git fetch --no-tags --depth=1 origin fcc0ad462172522aaf5c93a7b2e01f6b9f0b0159
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
