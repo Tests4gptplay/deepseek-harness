@@ -1,0 +1,167 @@
+name: Attachment platform smoke
+on:
+  push:
+    branches: [fix/android-termux-attachments-20261110]
+    paths:
+      - .github/workflows/attachment-platform-smoke.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  sharp-wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: '11.28.5'
+          package_json_file: ''
+      - name: Verify pnpm fallback without native binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/sharp-wasm-test"
+          cd "$RUNNER_TEMP/sharp-wasm-test"
+          printf '{"private":true}\n' > package.json
+          pnpm add --ignore-scripts --no-optional --save-exact sharp@0.35.5
+          node <<'JS'
+          try {
+            require('sharp');
+            throw new Error('Expected missing native/WASM backend');
+          } catch (error) {
+            if (!String(error).includes('Could not load the "sharp" module')) throw error;
+            console.log('BASELINE_BACKEND_MISSING_CONFIRMED');
+          }
+          JS
+          pnpm add --ignore-scripts --no-optional --save-exact @img/sharp-wasm32@0.35.5
+          node <<'JS' | tee "$RUNNER_TEMP/sharp-wasm-result.json"
+          const assert = require('node:assert/strict');
+          const { createRequire } = require('node:module');
+          const fromSharp = createRequire(require.resolve('sharp'));
+          const wasmPath = fromSharp.resolve('@img/sharp-wasm32/sharp.node');
+          const sharp = require('sharp');
+          (async () => {
+            const png = await sharp({ create: { width: 4, height: 4, channels: 3, background: '#00ff00' } }).png().toBuffer();
+            const meta = await sharp(png).metadata();
+            assert.equal(meta.width, 4);
+            assert.equal(meta.height, 4);
+            const jpeg = await sharp(png).resize(2, 2).jpeg().toBuffer();
+            assert.equal((await sharp(jpeg).metadata()).width, 2);
+            assert(Object.keys(require.cache).some(p => p.includes('/sharp-wasm32/')));
+            console.log(JSON.stringify({ status: 'ok', platform: process.platform, node: process.version, sharp: sharp.versions.sharp, wasmPath, pngBytes: png.length, jpegBytes: jpeg.length, pngDecode: true, jpegResizeEncode: true, nativeBinariesInstalled: false }, null, 2));
+          })().catch(error => { console.error(error); process.exitCode = 1; });
+          JS
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sharp-wasm-smoke
+          path: ${{ runner.temp }}/sharp-wasm-result.json
+          if-no-files-found: ignore
+  android-filesystem:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Build test-only unprivileged Android application
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager 'platforms;android-31' 'build-tools;35.0.0'
+          work="$RUNNER_TEMP/android-attachment-smoke"
+          mkdir -p "$work/src/org/tests4gptplay/attachmentsmoke" "$work/classes" "$work/dex"
+          cd "$work"
+          cat > src/org/tests4gptplay/attachmentsmoke/Smoke.java <<'JAVA'
+          package org.tests4gptplay.attachmentsmoke;
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.os.Build;
+          import android.system.Os;
+          import android.system.OsConstants;
+          import android.system.ErrnoException;
+          import java.io.*;
+          import java.util.Arrays;
+          import org.json.JSONObject;
+          public class Smoke extends Activity {
+            @Override public void onCreate(Bundle state) {
+              super.onCreate(state);
+              JSONObject result = new JSONObject();
+              try {
+                result.put("sdk", Build.VERSION.SDK_INT);
+                result.put("abi", Build.SUPPORTED_ABIS[0]);
+                result.put("uid", android.os.Process.myUid());
+                result.put("scope", "Android app syscalls; not full DSH or Termux");
+                int ancestorErrno = 0;
+                try { java.io.FileDescriptor fd = Os.open("/data/data", OsConstants.O_RDONLY, 0); Os.close(fd); }
+                catch (ErrnoException e) { ancestorErrno = e.errno; }
+                result.put("ancestorErrno", ancestorErrno);
+                File stage = new File(getFilesDir(), "stage");
+                File linked = new File(getFilesDir(), "linked");
+                File target = new File(getFilesDir(), "published");
+                byte[] bytes = "complete attachment bytes".getBytes("UTF-8");
+                try (FileOutputStream stream = new FileOutputStream(stage)) { stream.write(bytes); stream.getFD().sync(); }
+                int linkErrno = 0;
+                try { Os.link(stage.getPath(), linked.getPath()); }
+                catch (ErrnoException e) { linkErrno = e.errno; }
+                result.put("hardLinkErrno", linkErrno);
+                if (linkErrno == 0) Os.unlink(linked.getPath());
+                Os.rename(stage.getPath(), target.getPath());
+                Os.chmod(target.getPath(), 0400);
+                java.io.FileDescriptor directory = Os.open(getFilesDir().getPath(), OsConstants.O_RDONLY, 0);
+                try { Os.fsync(directory); } finally { Os.close(directory); }
+                byte[] actual = new byte[bytes.length];
+                try (FileInputStream stream = new FileInputStream(target)) {
+                  if (stream.read(actual) != bytes.length || stream.read() != -1 || !Arrays.equals(bytes, actual)) throw new IOException("readback mismatch");
+                }
+                if (stage.exists()) throw new IOException("stage was not consumed by rename");
+                if (android.os.Process.myUid() < 10000) throw new IOException("test did not run as an app UID");
+                result.put("renameReadback", true);
+                result.put("fileSync", true);
+                result.put("directorySync", true);
+                result.put("status", "ok");
+              } catch (Throwable error) {
+                try { result.put("status", "failed"); result.put("error", error.toString()); } catch (Exception ignored) { android.util.Log.e("AttachmentSmoke", "result construction", ignored); }
+                android.util.Log.e("AttachmentSmoke", "test failed", error);
+              }
+              try (FileOutputStream stream = new FileOutputStream(new File(getFilesDir(), "result.json"))) { stream.write(result.toString(2).getBytes("UTF-8")); stream.getFD().sync(); }
+              catch (Exception error) { android.util.Log.e("AttachmentSmoke", "cannot write result", error); }
+              finish();
+            }
+          }
+          JAVA
+          cat > AndroidManifest.xml <<'XML'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android" package="org.tests4gptplay.attachmentsmoke"><uses-sdk android:minSdkVersion="26" android:targetSdkVersion="28"/><application android:debuggable="true" android:label="Attachment test"><activity android:name=".Smoke" android:exported="true"/></application></manifest>
+          XML
+          bt="$ANDROID_HOME/build-tools/35.0.0"
+          android="$ANDROID_HOME/platforms/android-31/android.jar"
+          javac -source 8 -target 8 -classpath "$android" -d classes src/org/tests4gptplay/attachmentsmoke/Smoke.java
+          "$bt/d8" --lib "$android" --min-api 26 --output dex classes/org/tests4gptplay/attachmentsmoke/Smoke.class
+          "$bt/aapt" package -f -M AndroidManifest.xml -I "$android" -F unsigned.apk
+          (cd dex && zip -j ../unsigned.apk classes.dex)
+          "$bt/zipalign" -f 4 unsigned.apk aligned.apk
+          keytool -genkeypair -keystore test.jks -storepass testtest -keypass testtest -alias test -dname 'CN=Temporary Android attachment test' -keyalg RSA -validity 1
+          "$bt/apksigner" sign --ks test.jks --ks-pass pass:testtest --out smoke.apk aligned.apk
+      - name: Exercise Android 12 app filesystem permissions
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 31
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          script: |
+            adb shell getenforce
+            adb install "$RUNNER_TEMP/android-attachment-smoke/smoke.apk"
+            adb shell am start -W -n org.tests4gptplay.attachmentsmoke/.Smoke
+            adb exec-out run-as org.tests4gptplay.attachmentsmoke cat files/result.json > "$RUNNER_TEMP/android-filesystem-result.json"
+            cat "$RUNNER_TEMP/android-filesystem-result.json"
+            python3 -c 'import json,os; r=json.load(open(os.environ["RUNNER_TEMP"]+"/android-filesystem-result.json")); assert r["status"]=="ok",r; assert r["uid"]>=10000,r; assert r["ancestorErrno"] in [1,13],r; print("ANDROID_UNPRIVILEGED_FILESYSTEM_SMOKE_PASSED")'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: android-filesystem-smoke
+          path: ${{ runner.temp }}/android-filesystem-result.json
+          if-no-files-found: ignore
